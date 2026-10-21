@@ -117,7 +117,7 @@ def _response(status: int, payload: dict) -> dict:
 
 
 def _json_default(value):
-    if isinstance(value, (datetime,)):
+    if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, Decimal):
         return float(value)

@@ -82,9 +82,10 @@ The page polls `GET /uploads/{id}` and shows each stage with its numbers.
 | `db/01_schema.sql` | Database schema, including the `profile_key()` function used by the matcher |
 | `lambdas/loan_engine/` | Python 3.12 Lambda code: `api.py` (upload + status), `ingest.py` (CSV → Postgres), `csv_rows.py` (validation), `db.py`, `config.py`, `n8n.py` |
 | `tests/` | Unit tests for CSV parsing and validation (`pytest`) |
-| `ui/index.html` | The upload page: a single file with no build step |
+| `ui/index.html` | The upload page: a single file with no build step. It reads the API URL from `ui/config.js`, which `deploy.sh` generates (`config.example.js` shows the format). |
 | `scripts/` | Setup and deployment scripts (see below) |
 | `data/sample_users.csv` | The 10,000-user sample from the assignment |
+| `data/demo_users.csv` | 20 rows for a quick demo, including 2 deliberately invalid rows (shown in the rejects report) |
 
 ---
 
@@ -119,7 +120,7 @@ bash scripts/deploy.sh
 |---|---|---|
 | 1 | `setup-aws-params.sh` | Generates the DB password and the webhook secret, and stores them in SSM Parameter Store as SecureStrings |
 | 2 | `build-lambda-layer.sh` | Builds the `pg8000` layer for Linux arm64 and downloads the Amazon RDS CA bundle |
-| 3 | `npx serverless deploy` | Creates the CloudFormation stack (RDS takes about 8 minutes the first time) |
+| 3 | `npx serverless deploy` | Creates the CloudFormation stack (RDS takes about 8 minutes the first time). Serverless Framework **v3** is pinned in `package.json` because v4 requires a Serverless account login. v3's schema check prints a harmless warning about `python3.12`. |
 | 4 | `init-rds.sh` | Writes the RDS endpoint into `.env` and creates the schema (psql runs in Docker) |
 | 5 | `setup-ses.sh` | Requests SES verification for the sender and each test alias, and creates an access key for the send-only IAM user |
 | 6 | — | Writes `ui/config.js` with the API URL |
@@ -175,7 +176,8 @@ The local Postgres container is the same engine with the same schema, on host po
 ### Tear down
 
 ```bash
-npx serverless remove --region ap-south-1     # deletes RDS, S3 contents must be emptied first
+aws s3 rm s3://loan-engine-uploads-<account-id>-dev --recursive   # a bucket must be empty before deletion
+npx serverless remove --region ap-south-1                         # deletes RDS, Lambdas, API, queue, IAM user
 docker compose down
 ```
 
@@ -190,6 +192,7 @@ docker compose down
 - **Idempotent**: S3 can deliver an event twice. The Lambda atomically claims the batch (`pending|failed → processing`), so a duplicate event is ignored. Users are upserted on `user_id`, and when a file repeats a user, the last row wins.
 - **Failure handling**: a malformed file (for example, a missing column) fails the batch with a readable message and is not retried. Unexpected errors are retried twice by Lambda, then the event goes to an SQS failure queue. If n8n can't be reached, the users stay stored and the batch shows the error.
 - **Secrets** (DB password, webhook secret) live in SSM Parameter Store. CloudFormation resolves the DB password with `{{resolve:ssm-secure:…}}`, so it never appears in the template, and the Lambdas read secrets at runtime. Lambda → RDS uses TLS with full certificate verification against the RDS CA bundle.
+- **Open upload API**: `POST /uploads` has no authentication, to keep the demo UI simple. Anyone with the URL could create upload slots, but uploads are capped at 200 MB, expire after 15 minutes and are deleted after 30 days. In production I'd put Cognito or an API Gateway JWT authorizer in front of it.
 - **Trade-off**: the Lambdas run outside a VPC, so they can reach n8n over the internet without a NAT gateway (about $32/month). The cost is that RDS must accept connections from the internet (TLS-only, strong generated password). In production, I'd put the Lambdas and RDS in private subnets and give n8n a private route (VPN or n8n on ECS).
 
 ### Workflow A: crawling strategy
@@ -219,6 +222,25 @@ Further details:
 - **Data stays in the database**: n8n only handles the ≤ 45 profile groups per product, never the 10,000 × 20 pairs. Candidates are kept in a `match_candidates` table between stages.
 - **Fail closed**: if an LLM call fails, nothing is cached and no match is created for those profiles. The next run retries them.
 - **Each run's numbers** (pairs total → after SQL → profile groups → LLM calls → matches) are saved in `upload_batches.stats` and shown on the upload page.
+
+#### Measured results (real run, 22 Oct 2026)
+
+| | Value |
+|---|---|
+| Pages crawled / products extracted | 21 pages → 35 products from 20 lenders |
+| Crawl re-run with no page changes | **0 LLM calls** (all 21 hashes unchanged) |
+| Users ingested | 10,000 in 0.7 s (Lambda, streaming `COPY`) |
+| User × product pairs | 350,000 |
+| Left after the SQL pre-filter | 163,442 (−53%) |
+| (product, profile) groups sent to the LLM | 712 |
+| **LLM calls** | **34**, against ~350,000 for the naive approach |
+| Matches | 125,284 (all 10,000 users matched at least one product) |
+| Next upload of 3 new users | 1 LLM call (the other profiles were cached) |
+
+Two observations from the real data:
+
+- **The rules-only path didn't fire** on this data: every crawled product came back with some qualitative rule (employer type, salary account, city-based income tiers), so all survivors went through the LLM stage. The path exists for lenders whose criteria are fully numeric. A stricter extraction prompt could leave out soft "preferred" rules and send more products down it.
+- **Every user matched something** because the sample users all earn at least ₹25,000 and score at least 650, while most banks' published minimums are ₹15,000–25,000. The LLM did reject 165 of 707 profile groups. For example, it rejected business owners for SBI's pension loan: *"This loan is exclusively for government and defence pensioners."*
 
 ### Workflow C: notification
 

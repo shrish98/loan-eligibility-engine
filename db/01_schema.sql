@@ -146,5 +146,8 @@ CREATE TABLE matches (
     UNIQUE (user_id, product_id)   -- re-running matching never creates duplicates
 );
 
+-- The upload page's status endpoint counts matches per batch.
+CREATE INDEX idx_matches_batch ON matches (batch_id);
+
 -- Workflow C looks for "matches in this batch that haven't been emailed".
 CREATE INDEX idx_matches_pending ON matches (batch_id) WHERE notified_at IS NULL;

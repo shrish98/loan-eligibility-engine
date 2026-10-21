@@ -62,4 +62,4 @@ def transaction(conn: pg8000.native.Connection) -> Iterator[None]:
 def rows_as_dicts(conn: pg8000.native.Connection, sql: str, **params) -> list[dict]:
     rows = conn.run(sql, **params)
     columns = [c["name"] for c in conn.columns or []]
-    return [dict(zip(columns, row)) for row in rows]
+    return [dict(zip(columns, row, strict=True)) for row in rows]

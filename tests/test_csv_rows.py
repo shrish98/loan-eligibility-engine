@@ -11,7 +11,6 @@ from loan_engine.csv_rows import (
     parse_row,
 )
 
-HEADER = ["user_id", "name", "email", "monthly_income", "credit_score", "employment_status", "age"]
 GOOD = {
     "user_id": "b35de23e-755f-4c6a-81d8-f7dd99ce53ef",
     "name": "Dhruv Iyengar",

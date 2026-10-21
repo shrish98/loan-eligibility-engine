@@ -25,7 +25,7 @@ import uuid
 
 import boto3
 
-from . import config, db, n8n
+from . import db, n8n
 from .csv_rows import CsvFormatError, RowError, normalise_header, parse_row
 
 log = logging.getLogger()

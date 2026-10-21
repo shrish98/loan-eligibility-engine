@@ -33,9 +33,7 @@
         "path": "loan-engine/batch-ingested",
         "authentication": "headerAuth",
         "responseMode": "onReceived",
-        "options": {
-          "responseCode": 202
-        }
+        "options": {}
       },
       "credentials": {
         "httpHeaderAuth": {
@@ -304,7 +302,7 @@
         "operation": "executeQuery",
         "query": "-- Expand cached (product, profile) verdicts back to individual users, record\n-- per-stage numbers on the batch, and clear the temporary candidate rows.\nWITH llm_matches AS (\n  INSERT INTO matches (user_id, product_id, batch_id, match_stage, reason)\n  SELECT c.user_id, c.product_id, c.batch_id, 'llm', d.reason\n  FROM match_candidates c\n  JOIN loan_products p USING (product_id)\n  JOIN llm_decisions d ON d.product_id = c.product_id AND d.profile_key = c.profile_key\n                      AND d.notes_md5 = md5(p.eligibility_notes)\n  WHERE c.batch_id = $1::uuid AND d.eligible\n  ON CONFLICT (user_id, product_id) DO NOTHING\n  RETURNING 1\n),\ngroups AS (\n  SELECT count(DISTINCT (product_id, profile_key)) AS n FROM match_candidates WHERE batch_id = $1::uuid\n),\ncleared AS (DELETE FROM match_candidates WHERE batch_id = $1::uuid RETURNING 1)\nUPDATE upload_batches\nSET status = 'matched', updated_at = now(),\n    stats = stats || jsonb_build_object('matching', $2::jsonb || jsonb_build_object(\n      'llm_profile_groups', (SELECT n FROM groups),\n      'llm_matches', (SELECT count(*) FROM llm_matches),\n      'candidates_cleared', (SELECT count(*) FROM cleared)))\nWHERE batch_id = $1::uuid\nRETURNING batch_id, stats -> 'matching' AS matching",
         "options": {
-          "queryReplacement": "={{ [ $('Stage 1 · SQL pre-filter').first().json.batch_id, JSON.stringify({ ...$('Stage 1 · SQL pre-filter').first().json, llm_calls: $('Build one LLM request per product').all().filter(i => !i.json.noWork).length, finished_at: $now.toISO() }) ] }}"
+          "queryReplacement": "={{ [ $('Stage 1 · SQL pre-filter').first().json.batch_id, JSON.stringify({ ...$('Stage 1 · SQL pre-filter').first().json, llm_calls: $('Build one LLM request per product').all().filter(i => !i.json.noWork).length, llm_calls_failed: $('Build one LLM request per product').all().some(i => !i.json.noWork) ? $('Parse verdicts').all().filter(i => i.json.error || i.json.answered < i.json.asked).length : 0, finished_at: $now.toISO() }) ] }}"
         }
       },
       "credentials": {
