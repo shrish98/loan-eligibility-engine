@@ -136,7 +136,7 @@ bash scripts/publish-tunnel-url.sh  # tells the Lambda where Workflow B's webhoo
 
 Open <http://localhost:5678> and log in with `N8N_OWNER_EMAIL` / `N8N_OWNER_PASSWORD` from `.env`.
 
-> Quick-tunnel URLs change whenever the tunnel container restarts. Re-run `publish-tunnel-url.sh` after `docker compose up`. The Lambda reads the URL from SSM, so no redeploy is needed.
+> Free Cloudflare quick tunnels expire after a few hours, and their URL changes on every restart. `publish-tunnel-url.sh` restarts the tunnel, saves the new URL to SSM and checks that it reaches n8n. Run it after `docker compose up` and before a demo. The Lambda reads the URL from SSM, so no redeploy is needed.
 
 ### 4. Run it
 
@@ -155,7 +155,7 @@ Open <http://localhost:5678> and log in with `N8N_OWNER_EMAIL` / `N8N_OWNER_PASS
 | **Gemini API key** (*Header Auth*) | both Gemini HTTP nodes | Name `x-goog-api-key`, Value = your Gemini key |
 | **Ingest webhook secret** (*Header Auth*) | Workflow B's webhook | Name `X-Webhook-Secret`, Value = `N8N_WEBHOOK_SECRET`. Requests without it get 403. |
 
-Non-secret settings (`GEMINI_MODEL`, `SES_FROM_EMAIL`, `TEST_INBOX_ALIASES`, `MAX_EMAILS_PER_RUN`, `LLM_DELAY_SECONDS`) are passed to n8n as `APP_*` environment variables and read with `$env`.
+Non-secret settings (`GEMINI_MODEL`, default `gemini-flash-lite-latest`, which is available on new free-tier keys; `SES_FROM_EMAIL`, `TEST_INBOX_ALIASES`, `MAX_EMAILS_PER_RUN`, `LLM_DELAY_SECONDS`) are passed to n8n as `APP_*` environment variables and read with `$env`.
 
 ### Running without AWS (local only)
 
