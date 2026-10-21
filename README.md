@@ -224,6 +224,7 @@ Further details:
 
 - One email per user, listing their matched products sorted by interest rate, each with the reason it fits (from the SQL rule or the LLM verdict).
 - **Safety**: recipients are always rewritten to `TEST_INBOX_ALIASES`; the CSV's addresses are never used. `MAX_EMAILS_PER_RUN` caps sends, since the SES sandbox allows 200 a day at 1 per second, and a 1-second Wait sits between sends.
+- **Deliverability note**: in this demo the sender is a Gmail address verified in SES. Because the message is sent by Amazon's servers rather than Google's, it fails Gmail's DMARC alignment check and Gmail puts it in Spam (a "Never send to Spam" filter on the test aliases fixes this for the demo). In production, the sender would be a domain identity such as `alerts@yourcompany.com`, verified in SES with DKIM, SPF and a custom MAIL FROM domain, and the account would be moved out of the SES sandbox.
 - `notified_at` is set only after SES accepts the message (the SES node's error output skips it), so a failed send is retried next time. Each user is emailed only once per product.
 
 ---
