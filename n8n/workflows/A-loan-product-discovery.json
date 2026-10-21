@@ -1,0 +1,740 @@
+{
+  "id": "LoanCrawlerWfA01",
+  "name": "A · Loan Product Discovery (crawler)",
+  "active": false,
+  "nodes": [
+    {
+      "id": "52d7a9df-8045-49ac-a220-ea7740ce920f",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -360
+      ],
+      "parameters": {
+        "content": "## Workflow A · Loan product discovery\nRuns daily. Crawls **BankBazaar** two levels deep (rate table -> one eligibility page per bank), plus **Tata Capital** (lender) and **Paisabazaar** (marketplace).\n\n**Cost control:** each page's cleaned text is hashed. If the hash matches the last crawl, the LLM is skipped entirely, so a normal day with no website changes makes **zero** LLM calls.\n\nThe LLM turns each changed page into numeric rules (income, score, age, employment) that Workflow B can match with plain SQL. Only rules that cannot be numbers go into `eligibility_notes`.",
+        "width": 620,
+        "height": 260,
+        "color": 6
+      }
+    },
+    {
+      "id": "f7d0ff08-e0de-4024-ae73-bc8431e9ac6f",
+      "name": "Every day at 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "66707b98-bca9-4725-adc6-02334ca7a105",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "babfce98-382c-466a-a37a-52ce2e3c7af8",
+      "name": "Crawl targets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// The sites this crawler visits. BankBazaar's rate-comparison page is the\n// \"seed\": it links to one eligibility page per bank, which we follow.\nreturn [{\n  json: {\n    listingUrl: 'https://www.bankbazaar.com/personal-loan-interest-rate.html',\n    directPages: [\n      { url: 'https://www.tatacapital.com/personal-loan.html', site: 'tatacapital' },\n      { url: 'https://www.paisabazaar.com/personal-loan/', site: 'paisabazaar' },\n    ],\n    maxBankPages: 25,\n  },\n}];"
+      }
+    },
+    {
+      "id": "9efd7f1a-5182-4d81-a094-24ec0ff92916",
+      "name": "Fetch BankBazaar rate page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        100
+      ],
+      "parameters": {
+        "url": "={{ $json.listingUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36 (compatible; LoanEligibilityEngine/1.0)"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-IN,en;q=0.9"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "html"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000
+    },
+    {
+      "id": "8b4862fb-e578-47ac-aecf-218a2446674c",
+      "name": "Extract rate table + bank links",
+      "type": "n8n-nodes-base.html",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        100
+      ],
+      "parameters": {
+        "operation": "extractHtmlContent",
+        "dataPropertyName": "html",
+        "extractionValues": {
+          "values": [
+            {
+              "key": "tables",
+              "cssSelector": "table",
+              "returnValue": "text",
+              "returnArray": true
+            },
+            {
+              "key": "bankLinks",
+              "cssSelector": "a[href*=\"personal-loan-eligibility-calculator\"]",
+              "returnValue": "attribute",
+              "attribute": "href",
+              "returnArray": true
+            }
+          ]
+        },
+        "options": {
+          "trimValues": true,
+          "cleanUpText": true
+        }
+      }
+    },
+    {
+      "id": "1918cc86-275f-4135-a89b-d401ab15876a",
+      "name": "Build page list",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const seed = $('Crawl targets').first().json;\nconst { tables = [], bankLinks = [] } = $input.first().json;\n\n// The comparison table (bank -> rate range) is passed to the LLM as a hint,\n// because some bank eligibility pages don't repeat the interest rate.\nconst rateTable = tables.find(t => /interest rate/i.test(t) && /bank/i.test(t)) || '';\n\n// (The Code sandbox has no URL class, so resolve relative links by hand.)\nconst origin = seed.listingUrl.split('/').slice(0, 3).join('/');\nconst absolute = href => (/^https?:/.test(href) ? href : origin + (href.startsWith('/') ? '' : '/') + href);\nconst bankPages = [...new Set(bankLinks.map(absolute))]\n  .slice(0, seed.maxBankPages)\n  .map(url => ({ url, site: 'bankbazaar', rateHint: rateTable.slice(0, 3000) }));\n\nconst pages = [...bankPages, ...seed.directPages.map(p => ({ ...p, rateHint: '' }))];\nreturn pages.map(json => ({ json }));"
+      }
+    },
+    {
+      "id": "bd3ff6a0-8982-4de0-afae-1bce04a294e8",
+      "name": "For each page",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1200,
+        100
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "246f28a9-d16e-4fad-a90d-759790429443",
+      "name": "Fetch page",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        200
+      ],
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36 (compatible; LoanEligibilityEngine/1.0)"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-IN,en;q=0.9"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "html"
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "4c91dacf-f3ca-488a-a259-e4e8e47e3690",
+      "name": "Clean page text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const page = $('For each page').item.json;\nconst html = $json.html || '';\nif (!html) {\n  return { json: { ...page, failed: true, error: $json.error?.message || 'empty response', text: '' } };\n}\n\n// Strip markup but keep table cells and list items on separate lines, so\n// \"Minimum income | Rs. 25,000\" survives as readable text for the LLM.\nconst text = html\n  .replace(/<(script|style|noscript|svg|header|footer|nav|form)\\b[\\s\\S]*?<\\/\\1>/gi, ' ')\n  .replace(/<\\/(td|th)>/gi, ' | ')\n  .replace(/<(br|p|div|li|tr|h[1-6])\\b[^>]*>/gi, '\\n')\n  .replace(/<[^>]+>/g, ' ')\n  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#8377;|&#x20b9;/gi, '₹')\n  .replace(/&[a-z0-9#]+;/gi, ' ')\n  .replace(/[ \\t]+/g, ' ');\n\n// Drop duplicate and very short lines (menus repeat on every page).\nconst seen = new Set();\nconst lines = text.split('\\n').map(l => l.trim())\n  .filter(l => l.length > 2 && !seen.has(l) && seen.add(l));\n\nconst title = (html.match(/<title[^>]*>([^<]*)/i) || [])[1]?.trim() || '';\nreturn { json: { ...page, title, text: lines.join('\\n').slice(0, 30000) } };"
+      }
+    },
+    {
+      "id": "f1d82b96-72a4-4cb6-ab27-780c98ff6178",
+      "name": "Hash page text",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        200
+      ],
+      "parameters": {
+        "action": "hash",
+        "type": "SHA256",
+        "value": "={{ $json.text }}",
+        "dataPropertyName": "contentHash"
+      }
+    },
+    {
+      "id": "cc19c668-9e0d-4e02-ab1d-40b7b7068b25",
+      "name": "Load previous hash",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2160,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT (SELECT content_hash FROM source_pages WHERE url = $1) AS previous_hash",
+        "options": {
+          "queryReplacement": "={{ [ $json.url ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      }
+    },
+    {
+      "id": "e49737fc-5fd8-4512-a709-f2e8eaef60d0",
+      "name": "Page changed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2400,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('Clean page text').item.json.failed === true }}",
+              "rightValue": ""
+            },
+            {
+              "id": "c2",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              },
+              "leftValue": "={{ $json.previous_hash ?? \"\" }}",
+              "rightValue": "={{ $('Hash page text').item.json.contentHash }}"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b899f559-eb4e-46f3-a5c0-7366b8fa70bc",
+      "name": "Build extraction prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "    const page = $('Hash page text').item.json;\n\n    const instructions = `You extract personal-loan products from Indian lender web pages into rules for an automated matching engine.\n\nRules:\n- Output one product per distinct personal-loan offering whose eligibility is described on the page.\n- On a lender eligibility page (e.g. BankBazaar's \"<Bank> personal loan eligibility\"), output that bank's personal loan. Use the bank's own name as lender.\n- On a marketplace overview page that only lists generic criteria, output ONE product named \"<Site> Marketplace Personal Loan\" with the site as lender.\n- Numeric fields must be NECESSARY conditions: if thresholds differ by variant (e.g. salaried vs self-employed, with or without a salary account), use the most permissive number and describe the stricter variants in eligibility_notes.\n- min_monthly_income is net monthly income in INR. Convert annual figures to monthly.\n- min_credit_score only if the page states a required minimum. \"Preferred\" or \"recommended\" scores go in eligibility_notes.\n- allowed_employment uses only: \"Salaried\", \"Self-Employed\" (self-employed professionals such as doctors or CAs), \"Business\" (business owners, self-employed non-professionals). Use null if not stated.\n- eligibility_notes: short summary (max 400 characters) of requirements the numbers cannot capture and that could disqualify someone: employer type, salary account, work experience, residence stability, education, stricter conditional income tiers, preferred scores. null if there are none.\n- Interest rates are % per annum. If the page has none, use the rate table hint for this lender if present.\n- Never invent values. Use null when unknown.`;\n\n    const prompt = `Page URL: ${page.url}\\nPage title: ${page.title}\\n\\n` +\n      (page.rateHint ? `Rate table hint from the BankBazaar comparison page:\\n${page.rateHint}\\n\\n` : '') +\n      `Page text:\\n${page.text}`;\n\n    const num = { type: 'NUMBER', nullable: true };\n    const int = { type: 'INTEGER', nullable: true };\n    const geminiRequest = {\n      systemInstruction: { parts: [{ text: instructions }] },\n      contents: [{ role: 'user', parts: [{ text: prompt }] }],\n      generationConfig: {\n        temperature: 0,\n        responseMimeType: 'application/json',\n        responseSchema: {\n          type: 'OBJECT',\n          properties: {\n            products: {\n              type: 'ARRAY',\n              items: {\n                type: 'OBJECT',\n                properties: {\n                  lender: { type: 'STRING' },\n                  product_name: { type: 'STRING' },\n                  interest_rate_min: num, interest_rate_max: num,\n                  min_monthly_income: num,\n                  min_credit_score: int, max_credit_score: int,\n                  min_age: int, max_age: int,\n                  allowed_employment: {\n                    type: 'ARRAY', nullable: true,\n                    items: { type: 'STRING', enum: ['Salaried', 'Self-Employed', 'Business'] },\n                  },\n                  eligibility_notes: { type: 'STRING', nullable: true },\n                },\n                required: ['lender', 'product_name'],\n              },\n            },\n          },\n          required: ['products'],\n        },\n      },\n    };\n    return { json: { geminiRequest } };"
+      }
+    },
+    {
+      "id": "8c945fb6-a45c-4dd3-ae11-518b9a67e2b5",
+      "name": "Gemini: extract products",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $env.APP_GEMINI_MODEL }}:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.geminiRequest) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "geminiApiKey0001",
+          "name": "Gemini API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "4b25e561-05ab-4baf-ac00-437cdbd62ac3",
+      "name": "Validate & normalise",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Never trust LLM output blindly: parse, range-check and clean every field.\nconst page = $('Hash page text').item.json;\nlet products = [];\nlet error = null;\ntry {\n  const text = $json.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';\n  products = JSON.parse(text).products || [];\n} catch (e) {\n  error = $json.error?.message || `Could not parse LLM output: ${e.message}`;\n}\n\nconst inRange = (v, lo, hi) => (typeof v === 'number' && v >= lo && v <= hi ? v : null);\nconst EMPLOYMENT = ['Salaried', 'Self-Employed', 'Business'];\n\nconst clean = products\n  .filter(p => p.lender && p.product_name)\n  .map(p => {\n    const employment = (p.allowed_employment || []).filter(e => EMPLOYMENT.includes(e));\n    let rMin = inRange(p.interest_rate_min, 1, 60);\n    let rMax = inRange(p.interest_rate_max, 1, 60);\n    if (rMin && rMax && rMin > rMax) [rMin, rMax] = [rMax, rMin];\n    return {\n      lender: String(p.lender).trim().slice(0, 120),\n      product_name: String(p.product_name).trim().slice(0, 200),\n      interest_rate_min: rMin,\n      interest_rate_max: rMax,\n      min_monthly_income: inRange(p.min_monthly_income, 0, 10000000),\n      min_credit_score: inRange(p.min_credit_score, 300, 900),\n      max_credit_score: inRange(p.max_credit_score, 300, 900),\n      min_age: inRange(p.min_age, 18, 80),\n      max_age: inRange(p.max_age, 18, 100),\n      allowed_employment: employment.length ? [...new Set(employment)] : null,\n      eligibility_notes: p.eligibility_notes ? String(p.eligibility_notes).trim().slice(0, 600) || null : null,\n    };\n  });\n\n// Same lender + name twice on one page: keep the first.\nconst unique = [...new Map(clean.map(p => [`${p.lender}|${p.product_name}`.toLowerCase(), p])).values()];\n\nreturn {\n  json: {\n    url: page.url, site: page.site, contentHash: page.contentHash,\n    error, products: unique, productsJson: JSON.stringify(unique),\n  },\n};"
+      }
+    },
+    {
+      "id": "4c428415-c471-4935-aa1a-909f5264431e",
+      "name": "Extraction OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3360,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "ok",
+              "operator": {
+                "type": "string",
+                "operation": "empty",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.error ?? \"\" }}",
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0b1632fd-4dfa-436d-a683-4a8c184ea16b",
+      "name": "Save page + upsert products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3600,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One statement: record the page's new hash, upsert its products, and retire\n-- products that this page used to list but no longer does.\nWITH page AS (\n  INSERT INTO source_pages (url, site, content_hash, product_count, last_crawled_at, last_changed_at)\n  VALUES ($1, $2, $3, jsonb_array_length($4::jsonb), now(), now())\n  ON CONFLICT (url) DO UPDATE SET\n    content_hash = EXCLUDED.content_hash, product_count = EXCLUDED.product_count,\n    last_crawled_at = now(), last_changed_at = now()\n  RETURNING url\n),\nincoming AS (\n  SELECT * FROM jsonb_to_recordset($4::jsonb) AS p(\n    lender text, product_name text, interest_rate_min numeric, interest_rate_max numeric,\n    min_monthly_income numeric, min_credit_score int, max_credit_score int,\n    min_age int, max_age int, allowed_employment text[], eligibility_notes text)\n),\nupserted AS (\n  INSERT INTO loan_products (lender, product_name, source_url, interest_rate_min, interest_rate_max,\n    min_monthly_income, min_credit_score, max_credit_score, min_age, max_age,\n    allowed_employment, eligibility_notes, is_active, last_seen_at, updated_at)\n  SELECT lender, product_name, (SELECT url FROM page), interest_rate_min, interest_rate_max,\n    min_monthly_income, min_credit_score, max_credit_score, min_age, max_age,\n    allowed_employment, eligibility_notes, true, now(), now()\n  FROM incoming\n  ON CONFLICT (lender, product_name) DO UPDATE SET\n    source_url = EXCLUDED.source_url,\n    interest_rate_min = EXCLUDED.interest_rate_min, interest_rate_max = EXCLUDED.interest_rate_max,\n    min_monthly_income = EXCLUDED.min_monthly_income,\n    min_credit_score = EXCLUDED.min_credit_score, max_credit_score = EXCLUDED.max_credit_score,\n    min_age = EXCLUDED.min_age, max_age = EXCLUDED.max_age,\n    allowed_employment = EXCLUDED.allowed_employment, eligibility_notes = EXCLUDED.eligibility_notes,\n    is_active = true, last_seen_at = now(), updated_at = now()\n  RETURNING product_id\n),\nretired AS (\n  UPDATE loan_products SET is_active = false, updated_at = now()\n  WHERE source_url = $1 AND is_active AND product_id NOT IN (SELECT product_id FROM upserted)\n  RETURNING product_id\n)\nSELECT $1 AS url, (SELECT count(*) FROM upserted) AS products_saved, (SELECT count(*) FROM retired) AS products_retired",
+        "options": {
+          "queryReplacement": "={{ [ $json.url, $json.site, $json.contentHash, $json.productsJson ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      }
+    },
+    {
+      "id": "edb65e9c-7d95-4abe-a160-4cc14cc61d06",
+      "name": "Pause (LLM rate limit)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3840,
+        0
+      ],
+      "parameters": {
+        "amount": "={{ Number($env.APP_LLM_DELAY_SECONDS || 4) }}"
+      },
+      "webhookId": "e26efed5-f43c-4942-abfd-7f7332f5cd04"
+    },
+    {
+      "id": "505ef219-6b56-4711-ae69-a8a34edf7fa8",
+      "name": "Log extraction failure",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3600,
+        220
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "1227f7e3-564a-43a3-a16b-1b3f737df7c7",
+      "name": "Mark page unchanged",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2640,
+        340
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Unchanged page: no LLM call. Just record that we looked, and keep its products alive.\nWITH touched AS (\n  UPDATE source_pages SET last_crawled_at = now() WHERE url = $1 RETURNING url\n)\n-- (A failed fetch does not count as \"seen\", so a page that stays down retires its products.)\nUPDATE loan_products SET last_seen_at = now() WHERE source_url = $1 AND NOT $2::boolean\nRETURNING product_id",
+        "options": {
+          "queryReplacement": "={{ [ $('Clean page text').item.json.url, $('Clean page text').item.json.failed === true ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "3d200dd0-077d-4d41-a6f6-38558c74e3b4",
+      "name": "Retire stale products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1440,
+        -100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- After the loop: products not found by any crawl for 7 days are switched off,\n-- so users are never matched against a loan that has disappeared.\nWITH retired AS (\n  UPDATE loan_products SET is_active = false, updated_at = now()\n  WHERE is_active AND last_seen_at < now() - interval '7 days'\n  RETURNING product_id\n)\nSELECT (SELECT count(*) FROM retired) AS retired,\n       (SELECT count(*) FROM loan_products WHERE is_active) AS active_products,\n       (SELECT count(*) FROM source_pages WHERE last_crawled_at > now() - interval '1 hour') AS pages_crawled"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      },
+      "executeOnce": true
+    }
+  ],
+  "connections": {
+    "Every day at 06:00": {
+      "main": [
+        [
+          {
+            "node": "Crawl targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Crawl targets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crawl targets": {
+      "main": [
+        [
+          {
+            "node": "Fetch BankBazaar rate page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch BankBazaar rate page": {
+      "main": [
+        [
+          {
+            "node": "Extract rate table + bank links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract rate table + bank links": {
+      "main": [
+        [
+          {
+            "node": "Build page list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build page list": {
+      "main": [
+        [
+          {
+            "node": "For each page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "For each page": {
+      "main": [
+        [
+          {
+            "node": "Retire stale products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch page": {
+      "main": [
+        [
+          {
+            "node": "Clean page text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean page text": {
+      "main": [
+        [
+          {
+            "node": "Hash page text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash page text": {
+      "main": [
+        [
+          {
+            "node": "Load previous hash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load previous hash": {
+      "main": [
+        [
+          {
+            "node": "Page changed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page changed?": {
+      "main": [
+        [
+          {
+            "node": "Build extraction prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark page unchanged",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build extraction prompt": {
+      "main": [
+        [
+          {
+            "node": "Gemini: extract products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: extract products": {
+      "main": [
+        [
+          {
+            "node": "Validate & normalise",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & normalise": {
+      "main": [
+        [
+          {
+            "node": "Extraction OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraction OK?": {
+      "main": [
+        [
+          {
+            "node": "Save page + upsert products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log extraction failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save page + upsert products": {
+      "main": [
+        [
+          {
+            "node": "Pause (LLM rate limit)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pause (LLM rate limit)": {
+      "main": [
+        [
+          {
+            "node": "For each page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log extraction failure": {
+      "main": [
+        [
+          {
+            "node": "For each page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark page unchanged": {
+      "main": [
+        [
+          {
+            "node": "For each page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "tags": []
+}

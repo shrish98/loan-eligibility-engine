@@ -1,19 +1,65 @@
-# Local stack for the Loan Eligibility Engine.
+# Self-hosted side of the Loan Eligibility Engine.
 #
-#   postgres : application database (stands in for Amazon RDS when running locally;
-#              same engine, so the schema and SQL are identical in both places)
-#   n8n      : self-hosted workflow engine that runs Workflows A (crawler),
-#              B (matcher) and C (notifier)
+#   n8n      : workflow engine running Workflows A (crawler), B (matcher), C (notifier).
+#              Talks to Amazon RDS (Postgres), Amazon SES and the Gemini API.
+#   tunnel   : Cloudflare quick tunnel giving n8n a public HTTPS URL, so the ingest
+#              Lambda in AWS can call Workflow B's webhook. No account needed; the URL
+#              is printed in `docker compose logs tunnel` (scripts/publish-tunnel-url.sh
+#              copies it to SSM, where the Lambda reads it).
+#   postgres : OPTIONAL local database for offline development
+#              (`docker compose --profile local-db up -d`). Same engine as RDS, so the
+#              schema and SQL are identical.
 #
 # Usage:
-#   cp .env.example .env        # then fill in the values
+#   cp .env.example .env              # then fill in the values
 #   docker compose up -d
+#   bash scripts/n8n-bootstrap.sh     # imports credentials + workflows into n8n
 #   open http://localhost:5678
 
 name: loan-engine
 
 services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:2.44.4
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      # Encrypts the credentials (DB password, AWS keys, API keys) saved inside n8n.
+      # Keep it stable: if it changes, n8n can no longer decrypt saved credentials.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      # Lets n8n verify the RDS server certificate (downloaded by scripts/build-lambda-layer.sh).
+      NODE_EXTRA_CA_CERTS: /certs/rds-global-bundle.pem
+      # Workflows read the non-secret settings below through $env.
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      APP_GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      APP_SES_FROM_EMAIL: ${SES_FROM_EMAIL}
+      APP_TEST_INBOX_ALIASES: ${TEST_INBOX_ALIASES}
+      APP_MAX_EMAILS_PER_RUN: ${MAX_EMAILS_PER_RUN:-5}
+      APP_LLM_DELAY_SECONDS: ${LLM_DELAY_SECONDS:-4}
+    volumes:
+      # n8n's own data (users, credentials, execution history) lives here.
+      - n8n_data:/home/node/.n8n
+      # Workflow JSON files from the repo, imported by scripts/n8n-bootstrap.sh and
+      # exported back with:
+      #   docker compose exec n8n n8n export:workflow --all --separate --pretty --output=/workflows
+      - ./n8n/workflows:/workflows
+      - ./certs:/certs:ro
+
+  tunnel:
+    image: cloudflare/cloudflared:2026.9.1
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://n8n:5678
+    depends_on:
+      - n8n
+
   postgres:
+    profiles: ["local-db"]
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
@@ -21,8 +67,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
-      # Exposed so the Python scripts/Lambdas on your machine and tools like psql can connect.
-      - "5432:5432"
+      # 55432 on the host to avoid clashing with any other Postgres on 5432.
+      - "${LOCAL_PG_PORT:-55432}:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       # Every .sql file in ./db runs once, the first time the volume is created.
@@ -32,32 +78,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-
-  n8n:
-    image: docker.n8n.io/n8nio/n8n:2.44.4
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "5678:5678"
-    environment:
-      # Encrypts the credentials (DB password, AWS keys) that you save inside n8n.
-      # Keep it stable: if it changes, n8n can no longer decrypt saved credentials.
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
-      # Public base URL n8n uses when it prints webhook URLs. Change this to your
-      # tunnel URL (ngrok / cloudflared) if an AWS Lambda needs to call the webhook.
-      WEBHOOK_URL: ${N8N_WEBHOOK_URL}
-      GENERIC_TIMEZONE: Asia/Kolkata
-      TZ: Asia/Kolkata
-      N8N_DIAGNOSTICS_ENABLED: "false"
-      N8N_PERSONALIZATION_ENABLED: "false"
-    volumes:
-      # n8n's own data (users, credentials, execution history) lives here.
-      - n8n_data:/home/node/.n8n
-      # Shared folder for exporting/importing workflow JSON files into the repo:
-      #   docker compose exec n8n n8n export:workflow --all --separate --output=/workflows
-      - ./n8n/workflows:/workflows
 
 volumes:
   pg_data:

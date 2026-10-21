@@ -1,0 +1,518 @@
+{
+  "id": "LoanMatcherWfB01",
+  "name": "B · User-Loan Matching",
+  "active": false,
+  "nodes": [
+    {
+      "id": "cb030953-5cdf-494e-a118-cbeae50d459e",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -420
+      ],
+      "parameters": {
+        "content": "## Workflow B · Multi-stage matching\n**Stage 1 – SQL pre-filter (all pairs, milliseconds).** One set-based query joins this batch's users with every active product on the numeric rules. Products with no qualitative notes are matched right here, with no LLM.\n\n**Stage 2 – profile grouping + cache.** Survivors whose product has qualitative rules are grouped into coarse profiles (employment · income band · score band). The LLM is asked once per *(product, profile)*, not per user, and verdicts are cached in `llm_decisions`, so the next upload re-uses them.\n\n**Stage 3 – LLM verdicts.** One Gemini call per product (all its profiles in one prompt). Verdicts are expanded back to users with SQL.\n\nLLM calls scale with **products**, not users × products.",
+        "width": 700,
+        "height": 320,
+        "color": 6
+      }
+    },
+    {
+      "id": "22b31d93-a68b-4714-ab51-d10ad2796c13",
+      "name": "Batch ingested (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "loan-engine/batch-ingested",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "webhookSecret001",
+          "name": "Ingest webhook secret"
+        }
+      },
+      "webhookId": "9b3b3004-eecf-40b6-a2e3-9e160fe7751e"
+    },
+    {
+      "id": "f0ecdc3b-8ebf-4044-ae05-edb59962eba5",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0bec592e-09e0-4edc-ac7e-824abbf5901b",
+      "name": "Latest ingested batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        220,
+        200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT batch_id FROM upload_batches WHERE status IN ('ingested', 'matched', 'notified') ORDER BY updated_at DESC LIMIT 1"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      }
+    },
+    {
+      "id": "3e169c26-7163-403a-abe5-b835fca59d52",
+      "name": "Start matching",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        460,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Mark the batch as matching and clear leftovers from an interrupted earlier run.\nWITH cleared AS (DELETE FROM match_candidates WHERE batch_id = $1::uuid RETURNING 1)\nUPDATE upload_batches SET status = 'matching', error_message = NULL, updated_at = now()\nWHERE batch_id = $1::uuid AND status IN ('ingested', 'matching', 'matched', 'notified')\nRETURNING batch_id, (SELECT count(*) FROM cleared) AS cleared_candidates",
+        "options": {
+          "queryReplacement": "={{ [ $json.body?.batch_id ?? $json.batch_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      }
+    },
+    {
+      "id": "6a3e0841-04af-4b42-ac5b-0685a3a324cb",
+      "name": "Stage 1 · SQL pre-filter",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        700,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Set-based filter over every (user, product) pair of this batch.\n-- NULL criteria mean \"not stated\" and never exclude anyone.\nWITH bu AS (SELECT * FROM users WHERE batch_id = $1::uuid),\nap AS (SELECT * FROM loan_products WHERE is_active),\nsurvivors AS (\n  SELECT bu.user_id, ap.product_id,\n         ap.eligibility_notes IS NULL AS rules_only,\n         profile_key(bu.employment_status, bu.monthly_income, bu.credit_score) AS profile_key\n  FROM bu\n  JOIN ap ON (ap.min_monthly_income IS NULL OR bu.monthly_income >= ap.min_monthly_income)\n         AND (ap.min_credit_score   IS NULL OR bu.credit_score   >= ap.min_credit_score)\n         AND (ap.max_credit_score   IS NULL OR bu.credit_score   <= ap.max_credit_score)\n         AND (ap.min_age            IS NULL OR bu.age            >= ap.min_age)\n         AND (ap.max_age            IS NULL OR bu.age            <= ap.max_age)\n         AND (ap.allowed_employment IS NULL OR bu.employment_status = ANY (ap.allowed_employment))\n),\n-- Products whose rules are fully numeric: a survivor IS a match. No LLM needed.\nrule_matches AS (\n  INSERT INTO matches (user_id, product_id, batch_id, match_stage, reason)\n  SELECT user_id, product_id, $1::uuid, 'rules', 'Meets the income, credit score, age and employment criteria'\n  FROM survivors WHERE rules_only\n  ON CONFLICT (user_id, product_id) DO NOTHING   -- never email the same user about the same loan twice\n  RETURNING 1\n),\n-- Products with qualitative rules: park the pair for the LLM stage.\ncandidates AS (\n  INSERT INTO match_candidates (batch_id, user_id, product_id, profile_key)\n  SELECT $1::uuid, s.user_id, s.product_id, s.profile_key\n  FROM survivors s\n  WHERE NOT s.rules_only\n    AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.user_id = s.user_id AND m.product_id = s.product_id)\n  ON CONFLICT DO NOTHING\n  RETURNING 1\n)\nSELECT $1::uuid                                         AS batch_id,\n       (SELECT count(*) FROM bu)::int                   AS users,\n       (SELECT count(*) FROM ap)::int                   AS products,\n       ((SELECT count(*) FROM bu) * (SELECT count(*) FROM ap))::int AS pairs_total,\n       (SELECT count(*) FROM survivors)::int            AS pairs_after_sql,\n       (SELECT count(*) FROM rule_matches)::int         AS rule_matches,\n       (SELECT count(*) FROM candidates)::int           AS llm_candidate_pairs",
+        "options": {
+          "queryReplacement": "={{ [ $json.batch_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      }
+    },
+    {
+      "id": "16325f54-8bc4-4a2d-a921-8f0a6dbebfe7",
+      "name": "Stage 2 · Profiles without a cached verdict",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        940,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Collapse candidate pairs into (product, profile) groups, and skip every group\n-- the LLM has already judged for the current wording of the product's rules.\nSELECT c.product_id, p.lender, p.product_name, p.eligibility_notes,\n       md5(p.eligibility_notes) AS notes_md5, c.profile_key, count(*) AS users\nFROM match_candidates c\nJOIN loan_products p USING (product_id)\nLEFT JOIN llm_decisions d\n       ON d.product_id = c.product_id AND d.profile_key = c.profile_key\n      AND d.notes_md5 = md5(p.eligibility_notes)\nWHERE c.batch_id = $1::uuid AND d.product_id IS NULL\nGROUP BY c.product_id, p.lender, p.product_name, p.eligibility_notes, c.profile_key\nORDER BY c.product_id, c.profile_key",
+        "options": {
+          "queryReplacement": "={{ [ $('Stage 1 · SQL pre-filter').first().json.batch_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "d1dfef5c-363d-47b6-a130-64d89bfa2971",
+      "name": "Build one LLM request per product",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        100
+      ],
+      "parameters": {
+        "jsCode": "    const groups = $input.all().map(i => i.json).filter(g => g.product_id);\n    if (!groups.length) return [{ json: { noWork: true } }];\n\n    const describe = key => {\n      const [employment, income, score] = key.split('|');\n      return `${employment}, net monthly income ${income}, credit score ${score}`;\n    };\n\n    const instructions = `You are a loan eligibility analyst for an Indian lending marketplace.\nEvery profile below ALREADY meets this product's numeric criteria (minimum income, credit score, age, employment type); a database checked those.\nJudge ONLY the product's qualitative rules for each profile.\nWe do not know employer name, salary account, education, city or years of experience. Do NOT reject a profile because such a fact is unknown.\nReject only when the profile contradicts a rule (e.g. rule is for government employees and profile is Business) or when a stricter tier clearly cannot be met (e.g. income band is entirely below the only stated income tier for that employment type).\nFor each profile return eligible true/false and a reason of at most 20 words written for the customer.`;\n\n    // One request per product, all of its profiles together (chunks of 45 = every possible profile).\n    const byProduct = {};\n    for (const g of groups) (byProduct[g.product_id] ??= []).push(g);\n\n    const requests = [];\n    for (const list of Object.values(byProduct)) {\n      for (let i = 0; i < list.length; i += 45) {\n        const chunk = list.slice(i, i + 45);\n        const p = chunk[0];\n        const prompt = `Product: ${p.lender} – ${p.product_name}\\nQualitative rules: ${p.eligibility_notes}\\n\\nProfiles:\\n` +\n          chunk.map(g => `- profile_key \"${g.profile_key}\": ${describe(g.profile_key)} (${g.users} users)`).join('\\n');\n        requests.push({\n          json: {\n            product_id: p.product_id,\n            notes_md5: p.notes_md5,\n            profile_keys: chunk.map(g => g.profile_key),\n            users_covered: chunk.reduce((n, g) => n + Number(g.users), 0),\n            geminiRequest: {\n              systemInstruction: { parts: [{ text: instructions }] },\n              contents: [{ role: 'user', parts: [{ text: prompt }] }],\n              generationConfig: {\n                temperature: 0,\n                responseMimeType: 'application/json',\n                responseSchema: {\n                  type: 'OBJECT',\n                  properties: {\n                    verdicts: {\n                      type: 'ARRAY',\n                      items: {\n                        type: 'OBJECT',\n                        properties: {\n                          profile_key: { type: 'STRING' },\n                          eligible: { type: 'BOOLEAN' },\n                          reason: { type: 'STRING' },\n                        },\n                        required: ['profile_key', 'eligible', 'reason'],\n                      },\n                    },\n                  },\n                  required: ['verdicts'],\n                },\n              },\n            },\n          },\n        });\n      }\n    }\n    return requests;"
+      }
+    },
+    {
+      "id": "e2e7609b-7255-495e-acf9-756f6982c50a",
+      "name": "LLM work needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1420,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "work",
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              },
+              "leftValue": "={{ $json.noWork === true }}",
+              "rightValue": true
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c5f33749-9422-41d5-aea1-cefaf6499552",
+      "name": "For each LLM request",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1660,
+        0
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "88f4c919-81c0-4969-ab35-6a30d73dd99b",
+      "name": "Gemini: judge qualitative rules",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1900,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/{{ $env.APP_GEMINI_MODEL }}:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.geminiRequest) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "geminiApiKey0001",
+          "name": "Gemini API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "62b6c3aa-c89d-499c-a403-f05c8943de7c",
+      "name": "Parse verdicts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2140,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const req = $('For each LLM request').item.json;\nlet verdicts = [];\nlet error = null;\ntry {\n  const text = $json.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';\n  verdicts = JSON.parse(text).verdicts || [];\n} catch (e) {\n  // No verdict is stored, so these profiles stay unmatched now and are retried next run.\n  error = $json.error?.message || `Could not parse LLM output: ${e.message}`;\n}\nconst asked = new Set(req.profile_keys);\nconst rows = verdicts\n  .filter(v => asked.has(v.profile_key) && typeof v.eligible === 'boolean')\n  .map(v => ({\n    product_id: req.product_id,\n    profile_key: v.profile_key,\n    notes_md5: req.notes_md5,\n    eligible: v.eligible,\n    reason: String(v.reason || '').slice(0, 300),\n  }));\nreturn { json: { product_id: req.product_id, asked: asked.size, answered: rows.length, error, rowsJson: JSON.stringify(rows) } };"
+      }
+    },
+    {
+      "id": "df4ed4a3-48b6-4b2d-adf4-74126f1d8556",
+      "name": "Cache verdicts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2380,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO llm_decisions (product_id, profile_key, notes_md5, eligible, reason, model)\nSELECT product_id, profile_key, notes_md5, eligible, reason, $2\nFROM jsonb_to_recordset($1::jsonb)\n     AS d(product_id int, profile_key text, notes_md5 text, eligible boolean, reason text)\nON CONFLICT (product_id, profile_key, notes_md5) DO UPDATE\n  SET eligible = EXCLUDED.eligible, reason = EXCLUDED.reason, model = EXCLUDED.model, decided_at = now()\nRETURNING product_id",
+        "options": {
+          "queryReplacement": "={{ [ $json.rowsJson, $env.APP_GEMINI_MODEL ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "143a4bca-fdff-473d-ac3b-31e644c9fd22",
+      "name": "Pause (LLM rate limit)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2620,
+        100
+      ],
+      "parameters": {
+        "amount": "={{ Number($env.APP_LLM_DELAY_SECONDS || 4) }}"
+      },
+      "webhookId": "b2b2b99c-4b6e-46fb-a7b7-9c5ba65d76bc",
+      "executeOnce": true
+    },
+    {
+      "id": "f3d51fac-181d-45a2-ac83-51e27ce2dab9",
+      "name": "Stage 3 · Apply verdicts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1900,
+        -200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Expand cached (product, profile) verdicts back to individual users, record\n-- per-stage numbers on the batch, and clear the temporary candidate rows.\nWITH llm_matches AS (\n  INSERT INTO matches (user_id, product_id, batch_id, match_stage, reason)\n  SELECT c.user_id, c.product_id, c.batch_id, 'llm', d.reason\n  FROM match_candidates c\n  JOIN loan_products p USING (product_id)\n  JOIN llm_decisions d ON d.product_id = c.product_id AND d.profile_key = c.profile_key\n                      AND d.notes_md5 = md5(p.eligibility_notes)\n  WHERE c.batch_id = $1::uuid AND d.eligible\n  ON CONFLICT (user_id, product_id) DO NOTHING\n  RETURNING 1\n),\ngroups AS (\n  SELECT count(DISTINCT (product_id, profile_key)) AS n FROM match_candidates WHERE batch_id = $1::uuid\n),\ncleared AS (DELETE FROM match_candidates WHERE batch_id = $1::uuid RETURNING 1)\nUPDATE upload_batches\nSET status = 'matched', updated_at = now(),\n    stats = stats || jsonb_build_object('matching', $2::jsonb || jsonb_build_object(\n      'llm_profile_groups', (SELECT n FROM groups),\n      'llm_matches', (SELECT count(*) FROM llm_matches),\n      'candidates_cleared', (SELECT count(*) FROM cleared)))\nWHERE batch_id = $1::uuid\nRETURNING batch_id, stats -> 'matching' AS matching",
+        "options": {
+          "queryReplacement": "={{ [ $('Stage 1 · SQL pre-filter').first().json.batch_id, JSON.stringify({ ...$('Stage 1 · SQL pre-filter').first().json, llm_calls: $('Build one LLM request per product').all().filter(i => !i.json.noWork).length, finished_at: $now.toISO() }) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgLoanEngine0001",
+          "name": "Loan Engine Postgres (RDS)"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "6b4b8636-04be-45d7-a738-12236f108c7a",
+      "name": "Run Workflow C (notify)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.1,
+      "position": [
+        2140,
+        -200
+      ],
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "LoanNotifyWfC001",
+          "mode": "id"
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": false
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Batch ingested (webhook)": {
+      "main": [
+        [
+          {
+            "node": "Start matching",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Latest ingested batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Latest ingested batch": {
+      "main": [
+        [
+          {
+            "node": "Start matching",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start matching": {
+      "main": [
+        [
+          {
+            "node": "Stage 1 · SQL pre-filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 1 · SQL pre-filter": {
+      "main": [
+        [
+          {
+            "node": "Stage 2 · Profiles without a cached verdict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 2 · Profiles without a cached verdict": {
+      "main": [
+        [
+          {
+            "node": "Build one LLM request per product",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build one LLM request per product": {
+      "main": [
+        [
+          {
+            "node": "LLM work needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM work needed?": {
+      "main": [
+        [
+          {
+            "node": "For each LLM request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stage 3 · Apply verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "For each LLM request": {
+      "main": [
+        [
+          {
+            "node": "Stage 3 · Apply verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Gemini: judge qualitative rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini: judge qualitative rules": {
+      "main": [
+        [
+          {
+            "node": "Parse verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse verdicts": {
+      "main": [
+        [
+          {
+            "node": "Cache verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cache verdicts": {
+      "main": [
+        [
+          {
+            "node": "Pause (LLM rate limit)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pause (LLM rate limit)": {
+      "main": [
+        [
+          {
+            "node": "For each LLM request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Stage 3 · Apply verdicts": {
+      "main": [
+        [
+          {
+            "node": "Run Workflow C (notify)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "tags": []
+}

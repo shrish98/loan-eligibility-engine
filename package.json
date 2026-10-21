@@ -1,0 +1,12 @@
+{
+  "name": "loan-eligibility-engine",
+  "private": true,
+  "description": "Deployment tooling for the Loan Eligibility Engine (Serverless Framework v3)",
+  "scripts": {
+    "deploy": "bash scripts/deploy.sh",
+    "remove": "serverless remove"
+  },
+  "devDependencies": {
+    "serverless": "3.40.0"
+  }
+}

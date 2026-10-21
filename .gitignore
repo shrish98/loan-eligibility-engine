@@ -17,3 +17,10 @@ node_modules/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Build output / downloaded files
+.build/
+certs/
+lambdas/loan_engine/certs/
+.pytest_cache/
+ui/config.js

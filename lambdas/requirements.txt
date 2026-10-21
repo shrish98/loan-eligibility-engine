@@ -1,0 +1,2 @@
+# Runtime dependencies bundled into the Lambda layer (boto3 is already in the Lambda runtime).
+pg8000==1.31.2

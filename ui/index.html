@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loan Eligibility Engine</title>
+  <!-- API base URL, written by scripts/deploy.sh -->
+  <script src="config.js"></script>
+  <style>
+    :root {
+      --bg: #f5f7fb; --card: #ffffff; --text: #1d2433; --muted: #667085; --line: #e4e7ec;
+      --accent: #2557d6; --accent-soft: #e8eefc; --ok: #12805c; --ok-soft: #e3f4ec; --err: #c4320a; --err-soft: #fdece6;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0f1420; --card: #171d2b; --text: #e6e9f0; --muted: #98a2b3; --line: #2a3346;
+              --accent: #6f95ff; --accent-soft: #1f2a46; --ok: #4cc79a; --ok-soft: #15322a; --err: #ff8a65; --err-soft: #3a2018; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+           font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    main { max-width: 760px; margin: 0 auto; padding: 40px 16px 64px; }
+    h1 { font-size: 24px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 28px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 22px; margin-bottom: 18px; }
+    .drop { border: 2px dashed var(--line); border-radius: 10px; padding: 34px 16px; text-align: center; cursor: pointer;
+            transition: border-color .15s, background .15s; }
+    .drop.over, .drop:hover { border-color: var(--accent); background: var(--accent-soft); }
+    .drop strong { display: block; font-size: 16px; margin-bottom: 4px; }
+    .drop span { color: var(--muted); font-size: 13px; }
+    input[type=file] { display: none; }
+    .row { display: flex; gap: 12px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+    .file { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 20px;
+             font: inherit; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
+    .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin-top: 14px; display: none; }
+    .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+    .steps { list-style: none; margin: 0; padding: 0; }
+    .steps li { display: grid; grid-template-columns: 28px 1fr; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+    .steps li:last-child { border-bottom: 0; }
+    .dot { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--line); margin-top: 1px;
+           display: grid; place-items: center; font-size: 12px; color: transparent; }
+    .done .dot { background: var(--ok); border-color: var(--ok); color: #fff; }
+    .active .dot { border-color: var(--accent); animation: pulse 1.2s infinite; }
+    .failed .dot { background: var(--err); border-color: var(--err); color: #fff; }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 5px var(--accent-soft); } }
+    .steps b { display: block; }
+    .steps small { color: var(--muted); }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 16px; }
+    .stat { background: var(--bg); border-radius: 8px; padding: 10px 12px; }
+    .stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .stat .k { color: var(--muted); font-size: 12px; }
+    .msg { padding: 10px 12px; border-radius: 8px; margin-top: 14px; display: none; }
+    .msg.err { display: block; background: var(--err-soft); color: var(--err); }
+    .msg.ok { display: block; background: var(--ok-soft); color: var(--ok); }
+    code { font-size: 12px; color: var(--muted); }
+    #status { display: none; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Loan Eligibility Engine</h1>
+  <p class="sub">Upload a CSV of users. They are matched against crawled personal-loan products and notified by email.</p>
+
+  <section class="card">
+    <label class="drop" id="drop" for="file">
+      <strong>Drop a CSV here or click to choose</strong>
+      <span>Columns: user_id, name, email, monthly_income, credit_score, employment_status, age (max 200 MB)</span>
+    </label>
+    <input type="file" id="file" accept=".csv,text/csv">
+    <div class="row">
+      <div class="file" id="fileName">No file selected</div>
+      <button id="upload" disabled>Upload &amp; run pipeline</button>
+    </div>
+    <div class="bar" id="bar"><div></div></div>
+    <div class="msg" id="msg"></div>
+  </section>
+
+  <section class="card" id="status">
+    <ul class="steps" id="steps"></ul>
+    <div class="stats" id="stats"></div>
+    <p><code id="batch"></code></p>
+  </section>
+</main>
+
+<script>
+  const API = (window.LOAN_ENGINE_API || '').replace(/\/$/, '');
+  const $ = id => document.getElementById(id);
+  let file = null;
+
+  // Pipeline stages, in order, matching upload_batches.status.
+  const STEPS = [
+    { key: 'uploaded',  title: 'Uploaded to S3',          note: 'Sent straight from the browser to S3 (presigned POST)' },
+    { key: 'ingested',  title: 'Ingested into Postgres',  note: 'S3 event → Lambda streams, validates and stores the rows' },
+    { key: 'matched',   title: 'Matched (n8n Workflow B)', note: 'SQL pre-filter → profile grouping → LLM for qualitative rules' },
+    { key: 'notified',  title: 'Notified (n8n Workflow C)', note: 'Personalised emails sent through Amazon SES' },
+  ];
+  const ORDER = { pending: 0, processing: 1, ingested: 2, matching: 2, matched: 3, notified: 4 };
+
+  function pick(f) {
+    if (!f) return;
+    file = f;
+    $('fileName').textContent = `${f.name} · ${(f.size / 1024).toFixed(1)} KB`;
+    $('upload').disabled = false;
+    showMsg('');
+  }
+  $('file').addEventListener('change', e => pick(e.target.files[0]));
+  const drop = $('drop');
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => pick(e.dataTransfer.files[0]));
+
+  function showMsg(text, kind = 'err') {
+    $('msg').className = text ? `msg ${kind}` : 'msg';
+    $('msg').textContent = text;
+  }
+
+  $('upload').addEventListener('click', async () => {
+    if (!API) return showMsg('API URL missing: run scripts/deploy.sh to create ui/config.js.');
+    $('upload').disabled = true;
+    try {
+      // 1. Ask the API for a batch id and a presigned S3 POST.
+      const res = await fetch(`${API}/uploads`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, size: file.size }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error || `API error ${res.status}`);
+
+      // 2. Upload the file directly to S3 (never through API Gateway / Lambda).
+      await uploadToS3(body.upload, file);
+      showMsg('');
+      track(body.batch_id);
+    } catch (err) {
+      showMsg(err.message);
+      $('upload').disabled = false;
+    }
+  });
+
+  function uploadToS3({ url, fields }, f) {
+    return new Promise((resolve, reject) => {
+      const form = new FormData();
+      Object.entries(fields).forEach(([k, v]) => form.append(k, v));
+      form.append('file', f);  // must be the last field
+      const xhr = new XMLHttpRequest();
+      const bar = $('bar');
+      bar.style.display = 'block';
+      xhr.upload.onprogress = e => { bar.firstElementChild.style.width = `${(e.loaded / e.total) * 100}%`; };
+      xhr.onload = () => (xhr.status < 300 ? resolve() : reject(new Error(`S3 rejected the upload (${xhr.status})`)));
+      xhr.onerror = () => reject(new Error('Network error while uploading to S3'));
+      xhr.open('POST', url);
+      xhr.send(form);
+    });
+  }
+
+  async function track(batchId) {
+    $('status').style.display = 'block';
+    $('batch').textContent = `batch ${batchId}`;
+    const started = Date.now();
+    while (Date.now() - started < 15 * 60 * 1000) {
+      try {
+        const res = await fetch(`${API}/uploads/${batchId}`);
+        if (res.ok) {
+          const b = await res.json();
+          render(b);
+          if (b.status === 'notified' || b.status === 'failed') break;
+        }
+      } catch (_) { /* transient network error: keep polling */ }
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    $('upload').disabled = false;
+  }
+
+  function render(b) {
+    const reached = ORDER[b.status] ?? 0;
+    const failed = b.status === 'failed';
+    $('steps').innerHTML = STEPS.map((s, i) => {
+      const n = i + 1;
+      const cls = failed && n === reached + 1 ? 'failed' : n <= reached ? 'done' : n === reached + 1 ? 'active' : '';
+      return `<li class="${cls}"><span class="dot">${cls === 'failed' ? '!' : '✓'}</span>
+              <div><b>${s.title}</b><small>${s.note}</small></div></li>`;
+    }).join('');
+
+    const ing = b.stats?.ingest || {}, m = b.stats?.matching || {}, n = b.stats?.notify || {};
+    const fmt = v => (v === undefined || v === null ? '–' : Number(v).toLocaleString('en-IN'));
+    const tiles = [
+      ['Rows stored', b.row_count], ['Rows rejected', b.rejected_count],
+      ['User × product pairs', m.pairs_total], ['Pairs left after SQL', m.pairs_after_sql],
+      ['Matched by rules', m.rule_matches], ['LLM profile groups', m.llm_profile_groups],
+      ['LLM calls', m.llm_calls], ['Matched by LLM', m.llm_matches],
+      ['Users with matches', b.matched_users], ['Emails sent', n.users_emailed],
+    ];
+    $('stats').innerHTML = tiles.map(([k, v]) => `<div class="stat"><div class="v">${fmt(v)}</div><div class="k">${k}</div></div>`).join('');
+
+    if (b.error_message) showMsg(b.error_message);
+    else if (b.status === 'notified') showMsg('Pipeline complete. Check the test inbox for the emails.', 'ok');
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,229 @@
+# AWS side of the Loan Eligibility Engine.
+#
+#   Browser ──POST /uploads──▶ API Gateway ─▶ createUpload Lambda ─▶ presigned S3 POST
+#   Browser ──CSV (direct)───▶ S3 uploads/<batch_id>.csv
+#   S3 ObjectCreated ────────▶ ingestCsv Lambda ─▶ RDS Postgres ─▶ n8n webhook (Workflow B)
+#   Browser ──GET /uploads/{id}▶ getBatch Lambda (status polling)
+#
+# Deploy:  bash scripts/deploy.sh   (wraps `npx serverless deploy` with the setup steps)
+
+service: loan-eligibility-engine
+frameworkVersion: "3"
+
+params:
+  default:
+    # Who may connect to Postgres. The Lambdas run outside a VPC (which avoids a
+    # paid NAT gateway for reaching n8n), so they have no fixed IP. Access is
+    # protected by TLS-only connections and a generated password. Narrow this
+    # to your own IP (x.x.x.x/32) if you don't need the Lambdas, e.g. for a demo
+    # of n8n only.
+    allowedDbCidr: 0.0.0.0/0
+
+custom:
+  dbName: loan_engine
+  dbUser: loan_admin
+  uploadBucket: loan-engine-uploads-${aws:accountId}-${sls:stage}
+  ssmPrefix: /loan-engine
+
+provider:
+  name: aws
+  runtime: python3.12
+  architecture: arm64
+  region: ${opt:region, env:AWS_REGION, 'ap-south-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 29
+  logRetentionInDays: 14
+  layers:
+    - !Ref DepsLambdaLayer
+  environment:
+    DB_HOST: !GetAtt Database.Endpoint.Address
+    DB_PORT: !GetAtt Database.Endpoint.Port
+    DB_NAME: ${self:custom.dbName}
+    DB_USER: ${self:custom.dbUser}
+    DB_SSL: verify-full
+    DB_PASSWORD_PARAM: ${self:custom.ssmPrefix}/db-password
+    UPLOAD_BUCKET: ${self:custom.uploadBucket}
+  httpApi:
+    cors:
+      allowedOrigins: ["*"]
+      allowedHeaders: [Content-Type]
+      allowedMethods: [GET, POST, OPTIONS]
+  iam:
+    role:
+      statements:
+        # Read secrets/config from Parameter Store (SecureStrings use the AWS-managed key).
+        - Effect: Allow
+          Action: ssm:GetParameter
+          Resource: arn:aws:ssm:${aws:region}:${aws:accountId}:parameter${self:custom.ssmPrefix}/*
+        # Ingest reads uploads; createUpload signs uploads (needs PutObject); ingest writes rejects.
+        - Effect: Allow
+          Action: [s3:GetObject, s3:PutObject]
+          Resource:
+            - arn:aws:s3:::${self:custom.uploadBucket}/uploads/*
+            - arn:aws:s3:::${self:custom.uploadBucket}/rejects/*
+        - Effect: Allow
+          Action: sqs:SendMessage
+          Resource: !GetAtt IngestFailureQueue.Arn
+
+package:
+  patterns:
+    - "!**"
+    - lambdas/loan_engine/**
+    - "!lambdas/**/__pycache__/**"
+
+layers:
+  deps:
+    package:
+      artifact: .build/layer.zip   # built by scripts/build-lambda-layer.sh
+    description: pg8000 Postgres driver
+    compatibleRuntimes: [python3.12]
+    compatibleArchitectures: [arm64]
+
+functions:
+  createUpload:
+    handler: lambdas/loan_engine/api.create_upload
+    description: Creates an upload batch and returns a presigned S3 POST for the CSV
+    events:
+      - httpApi: { method: POST, path: /uploads }
+
+  getBatch:
+    handler: lambdas/loan_engine/api.get_batch
+    description: Returns the status and per-stage numbers of an upload batch
+    events:
+      - httpApi: { method: GET, path: "/uploads/{batch_id}" }
+
+  ingestCsv:
+    handler: lambdas/loan_engine/ingest.handler
+    description: Streams an uploaded CSV into Postgres, then triggers n8n Workflow B
+    timeout: 900
+    memorySize: 1024
+    # Tip for production: set reservedConcurrency to bound DB connections. New
+    # AWS accounts have a 10-concurrency limit that doesn't allow reserving any.
+    maximumRetryAttempts: 2
+    destinations:
+      onFailure:
+        type: sqs
+        arn: !GetAtt IngestFailureQueue.Arn
+    environment:
+      N8N_WEBHOOK_URL_PARAM: ${self:custom.ssmPrefix}/n8n-webhook-url
+      N8N_WEBHOOK_SECRET_PARAM: ${self:custom.ssmPrefix}/n8n-webhook-secret
+    # The S3 trigger is wired in resources (UploadBucket.NotificationConfiguration)
+    # so the bucket can also carry its CORS and lifecycle settings.
+
+resources:
+  Resources:
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: IngestInvokePermission
+      Properties:
+        BucketName: ${self:custom.uploadBucket}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+        CorsConfiguration:
+          CorsRules:
+            - AllowedMethods: [POST]
+              AllowedOrigins: ["*"]
+              AllowedHeaders: ["*"]
+              MaxAge: 3000
+        LifecycleConfiguration:
+          Rules:
+            - Id: expire-uploads
+              Status: Enabled
+              Prefix: uploads/
+              ExpirationInDays: 30
+            - Id: expire-rejects
+              Status: Enabled
+              Prefix: rejects/
+              ExpirationInDays: 30
+        NotificationConfiguration:
+          LambdaConfigurations:
+            - Event: s3:ObjectCreated:*
+              Function: !GetAtt IngestCsvLambdaFunction.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - { Name: prefix, Value: uploads/ }
+                    - { Name: suffix, Value: .csv }
+
+    IngestInvokePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt IngestCsvLambdaFunction.Arn
+        Principal: s3.amazonaws.com
+        SourceAccount: !Ref AWS::AccountId
+        SourceArn: arn:aws:s3:::${self:custom.uploadBucket}
+
+    # Events the ingest Lambda still failed on after its retries end up here.
+    IngestFailureQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: loan-engine-ingest-failures-${sls:stage}
+        MessageRetentionPeriod: 1209600
+
+    DatabaseSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Postgres access for the Lambdas and the self-hosted n8n
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            CidrIp: ${param:allowedDbCidr}
+
+    Database:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Delete
+      Properties:
+        DBInstanceIdentifier: loan-engine-${sls:stage}
+        Engine: postgres
+        EngineVersion: "16"
+        DBInstanceClass: db.t4g.micro
+        AllocatedStorage: "20"
+        StorageType: gp3
+        StorageEncrypted: true
+        DBName: ${self:custom.dbName}
+        MasterUsername: ${self:custom.dbUser}
+        # Resolved by CloudFormation at deploy time; never stored in the template.
+        MasterUserPassword: "{{resolve:ssm-secure:${self:custom.ssmPrefix}/db-password}}"
+        PubliclyAccessible: true
+        VPCSecurityGroups:
+          - !GetAtt DatabaseSecurityGroup.GroupId
+        MultiAZ: false
+        BackupRetentionPeriod: 0
+        DeletionProtection: false
+        AutoMinorVersionUpgrade: true
+        # Postgres 16 on RDS rejects non-TLS connections by default (rds.force_ssl=1).
+
+    # Send-only identity for n8n's AWS SES node. Its access key is created by
+    # scripts/setup-ses.sh and stored only in your .env and n8n's encrypted credentials.
+    SesSenderUser:
+      Type: AWS::IAM::User
+      Properties:
+        UserName: loan-engine-n8n-ses-${sls:stage}
+        Policies:
+          - PolicyName: ses-send-only
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: [ses:SendEmail, ses:SendRawEmail]
+                  Resource: arn:aws:ses:${aws:region}:${aws:accountId}:identity/*
+
+  Outputs:
+    DatabaseEndpoint:
+      Value: !GetAtt Database.Endpoint.Address
+    UploadBucketName:
+      Value: ${self:custom.uploadBucket}
+    SesSenderUserName:
+      Value: !Ref SesSenderUser
+    IngestFailureQueueUrl:
+      Value: !Ref IngestFailureQueue
