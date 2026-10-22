@@ -22,9 +22,14 @@ aws ssm put-parameter --region "$AWS_REGION" --name /loan-engine/n8n-webhook-url
   --type String --value "$webhook" --overwrite >/dev/null
 
 # Wait until the new public URL actually reaches n8n (403 = n8n answered and wanted the secret).
-for _ in $(seq 1 30); do
+# A brand-new quick-tunnel hostname can take a minute or two to start resolving.
+for _ in $(seq 1 60); do
   code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$webhook" || true)"
   [ "$code" = "403" ] && break
-  sleep 2
+  sleep 3
 done
-echo "Lambda will call: $webhook (public check: HTTP $code)"
+if [ "$code" != "403" ]; then
+  echo "Tunnel not reachable yet (HTTP $code). Wait a minute and re-run this script." >&2
+  exit 1
+fi
+echo "Lambda will call: $webhook (public check OK)"
