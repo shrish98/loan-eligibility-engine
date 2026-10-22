@@ -142,7 +142,7 @@ Open <http://localhost:5678> and log in with `N8N_OWNER_EMAIL` / `N8N_OWNER_PASS
 ### 4. Run it
 
 1. In n8n, open **A · Loan Product Discovery** and click **Execute workflow** to fill `loan_products` (it also runs daily at 06:00).
-2. Open `ui/index.html` in a browser, choose `data/sample_users.csv` and click **Upload & run pipeline**.
+2. Serve the page with `python -m http.server 8080 --directory ui` and open <http://localhost:8080> (browsers block API calls from pages opened as `file://`), choose `data/sample_users.csv` and click **Upload & run pipeline**.
 3. Watch the stages complete, then check the test inbox.
 
 ### How credentials are configured in n8n
