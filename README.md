@@ -81,10 +81,10 @@ The page polls `GET /uploads/{id}` and shows each stage with its numbers.
 | `n8n/workflows/*.json` | Workflows A, B and C, exported from n8n |
 | `db/01_schema.sql` | Database schema, including the `profile_key()` function used by the matcher |
 | `lambdas/loan_engine/` | Python 3.12 Lambda code: `api.py` (upload + status), `ingest.py` (CSV → Postgres), `csv_rows.py` (validation), `db.py`, `config.py`, `n8n.py` |
-| `tests/` | Unit tests for CSV parsing and validation (`pytest`) |
+| `tests/` | 47 `pytest` unit tests for CSV validation, the upload API, the ingest Lambda, the n8n hand-off and the secrets cache, run by GitHub Actions on every push |
 | `ui/index.html` | The upload page: a single file with no build step. It reads the API URL from `ui/config.js`, which `deploy.sh` generates (`config.example.js` shows the format). |
 | `scripts/` | Setup and deployment scripts (see below) |
-| `data/sample_users.csv` | The 10,000-user sample from the assignment |
+| `data/sample_users.csv` | A 10,000-user sample dataset |
 | `data/demo_users.csv` | 20 rows for a quick demo, including 2 deliberately invalid rows (shown in the rejects report) |
 
 ---
@@ -173,6 +173,13 @@ The local Postgres container is the same engine with the same schema, on host po
 .venv/Scripts/python -m pytest
 ```
 
+The tests replace S3, SSM, Postgres and the n8n webhook with in-memory fakes, so they need no AWS account or database. Besides row validation, they cover:
+
+- **Upload API**: rejected file types and sizes, and the signed S3 policy that caps uploads at 200 MB.
+- **Ingest Lambda**: chunked `COPY`, the rejects report, duplicate users in one file, Excel's byte-order mark, ignored duplicate S3 events, bad files that fail without a retry, unexpected errors that are re-raised for Lambda's retries, and users that stay stored when n8n is down.
+- **n8n hand-off**: the shared-secret header, and exponential backoff (2 s, then 4 s) before giving up.
+- **Secrets**: the SSM cache and its expiry.
+
 ### Tear down
 
 ```bash
@@ -198,13 +205,14 @@ docker compose down
 ### Workflow A: crawling strategy
 
 - **Sources**: BankBazaar is crawled **two levels deep**. Its rate-comparison page gives a table of bank rates and links to about 20 per-bank *eligibility* pages, which are followed. Tata Capital's own product page adds a lender-direct source, and Paisabazaar's marketplace page adds generic market criteria.
+- **Crawling etiquette**: the crawler runs once a day, fetches about 21 public product pages, identifies itself in its user agent (`LoanEligibilityEngine/1.0`) and never logs in. Every page it fetches is allowed by that site's `robots.txt` (checked November 2026). Thanks to content hashing, unchanged pages are never sent to the LLM. Before running this against these sites for anything beyond a demo, read their terms of use too.
 - **Link discovery, not a hard-coded list**: the HTML node selects `a[href*="personal-loan-eligibility-calculator"]`, so a new bank added to BankBazaar is picked up automatically.
 - **Content hashing**: each page's cleaned text is hashed with SHA-256 (Crypto node) and compared with `source_pages.content_hash`. Unchanged pages skip the LLM, so a typical daily run makes **zero LLM calls**.
 - **LLM as a parser, with structured output**: Gemini receives the cleaned page text plus the BankBazaar rate table as a hint, and must return JSON that matches a `responseSchema`. A Code node then range-checks every field. Interest rates must be 1–60%, credit scores 300–900, and employment is restricted to the three values used in the CSV.
 - **Numbers are necessary conditions**: the prompt asks for the most permissive threshold of each rule (for example, "₹25k with a salary account, ₹30k without" becomes `min_monthly_income = 25000`). The stricter variants go into `eligibility_notes`. This way the SQL filter never wrongly excludes anyone, and the LLM handles the nuance.
 - **Lifecycle**: products a page no longer lists are deactivated straight away. Products no crawl has seen for 7 days are retired, so users are never matched to a loan that has disappeared.
 
-### Workflow B: the Optimization Treasure Hunt
+### Workflow B: matching 10,000 users with 34 LLM calls
 
 The naive approach asks the LLM about every user–product pair: 10,000 users × ~20 products = **~200,000 LLM calls**. This pipeline makes about **one LLM call per product that has qualitative rules**, and that number doesn't grow with the number of users.
 
